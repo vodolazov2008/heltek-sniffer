@@ -23,6 +23,12 @@ SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
 
+// ---------- Кнопка USER / PRG ----------
+// На Heltec WiFi LoRa 32 V3 кнопка USER подключена к GPIO0.
+// Внимание: GPIO0 — strapping-пин. Не удерживайте кнопку при включении/сбросе,
+// иначе плата может войти в режим загрузчика вместо обычной работы.
+#define BUTTON_PIN 0
+
 // ---------- Параметры по умолчанию ----------
 float   freq       = 868.0;
 float   bw         = 125.0;
@@ -68,9 +74,7 @@ struct Preset {
     uint8_t sync;
 };
 
-// Пресеты. При необходимости расширяйте — лимит MAX_PRESETS.
 const Preset presets[] = {
-    // LoRaWAN EU868 (sync 0x34)
     {"LW 868.1 SF7",  868.1, 125.0,  7, 0x34},
     {"LW 868.1 SF9",  868.1, 125.0,  9, 0x34},
     {"LW 868.1 SF12", 868.1, 125.0, 12, 0x34},
@@ -78,10 +82,8 @@ const Preset presets[] = {
     {"LW 868.3 SF12", 868.3, 125.0, 12, 0x34},
     {"LW 868.5 SF7",  868.5, 125.0,  7, 0x34},
     {"LW 868.5 SF12", 868.5, 125.0, 12, 0x34},
-    // Meshtastic EU868 (sync 0x2B, BW 250)
     {"MT 869.5 SF11", 869.525, 250.0, 11, 0x2B},
     {"MT 869.5 SF9",  869.525, 250.0,  9, 0x2B},
-    // Приватные сети (sync 0x12)
     {"PV 868 SF7",    868.0, 125.0,  7, 0x12},
     {"PV 868 SF9",    868.0, 125.0,  9, 0x12},
     {"PV 868 SF12",   868.0, 125.0, 12, 0x12},
@@ -96,12 +98,20 @@ int  currentPresetIdx = -1;
 uint32_t presetStartTime = 0;
 uint16_t presetHits[MAX_PRESETS] = {0};
 
-// Сохранённые пользовательские настройки на время сканирования
 float   savedFreq;
 float   savedBw;
 uint8_t savedSf, savedCr, savedSync;
 uint16_t savedPreamble;
 bool    savedCrc, savedIq;
+
+// ---------- Антидребезг кнопки ----------
+bool     buttonLastState       = HIGH;
+bool     buttonStableState     = HIGH;
+uint32_t buttonLastChangeMs    = 0;
+uint32_t buttonPressStartMs    = 0;
+bool     buttonWasPressed      = false;
+const uint32_t DEBOUNCE_MS     = 50;
+const uint32_t MIN_PRESS_MS    = 50;
 
 // ---------- Прерывание DIO1 ----------
 void IRAM_ATTR onDio1() {
@@ -135,7 +145,7 @@ void loadConfig() {
     prefs.end();
 }
 
-// ---------- Применение настроек радио ----------
+// ---------- Радио ----------
 void applyRadioConfig() {
     radio.standby();
     radio.setFrequency(freq);
@@ -155,12 +165,12 @@ void applyRadioConfig() {
 void applyPreset(int idx) {
     if (idx < 0 || idx >= presetCount) return;
     const Preset &p = presets[idx];
-    packetReceived = false;      // сброс возможного «зависшего» IRQ
+    packetReceived = false;
     radio.standby();
     radio.setFrequency(p.freq);
     radio.setBandwidth(p.bw);
     radio.setSpreadingFactor(p.sf);
-    radio.setCodingRate(5);       // 4/5
+    radio.setCodingRate(5);
     radio.setSyncWord(p.sync);
     radio.setPreambleLength(8);
     radio.setCRC(true);
@@ -171,7 +181,6 @@ void applyPreset(int idx) {
 
 void startScan() {
     if (scanMode) return;
-    // Сохраняем текущие настройки пользователя
     savedFreq = freq; savedBw = bw; savedSf = sf; savedCr = cr;
     savedSync = syncWord; savedPreamble = preamble;
     savedCrc = crcOn; savedIq = iqInverted;
@@ -190,7 +199,6 @@ void stopScan() {
     int lastIdx = currentPresetIdx;
     currentPresetIdx = -1;
 
-    // Восстанавливаем пользовательские настройки
     freq = savedFreq; bw = savedBw; sf = savedSf; cr = savedCr;
     syncWord = savedSync; preamble = savedPreamble;
     crcOn = savedCrc; iqInverted = savedIq;
@@ -207,6 +215,47 @@ void checkScanTimer() {
     }
 }
 
+// ---------- Обработка кнопки ----------
+void checkButton() {
+    bool raw = digitalRead(BUTTON_PIN);
+    uint32_t now = millis();
+
+    // Фиксируем изменение «сырого» состояния для антидребезга
+    if (raw != buttonLastState) {
+        buttonLastChangeMs = now;
+        buttonLastState = raw;
+    }
+
+    // Если «сырое» состояние стабильно дольше DEBOUNCE_MS — принимаем его
+    if (now - buttonLastChangeMs >= DEBOUNCE_MS) {
+        if (raw != buttonStableState) {
+            buttonStableState = raw;
+
+            if (buttonStableState == LOW) {
+                // Нажатие началось
+                buttonPressStartMs = now;
+                buttonWasPressed = true;
+            } else {
+                // Кнопка отпущена
+                if (buttonWasPressed) {
+                    uint32_t held = now - buttonPressStartMs;
+                    buttonWasPressed = false;
+                    if (held >= MIN_PRESS_MS) {
+                        // Короткое нажатие — переключаем сканирование
+                        if (scanMode) {
+                            stopScan();
+                        } else {
+                            startScan();
+                        }
+                        Serial.printf("Button press (%lu ms) -> scan %s\n",
+                                      (unsigned long)held, scanMode ? "ON" : "OFF");
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------- OLED ----------
 void updateDisplay() {
     u8g2.clearBuffer();
@@ -219,7 +268,6 @@ void updateDisplay() {
         u8g2.setCursor(0, 24);
         u8g2.print(presets[currentPresetIdx].name);
 
-        // Прогресс-бар
         uint32_t elapsed = millis() - presetStartTime;
         int barW = (int)(elapsed * 124 / PRESET_DURATION_MS);
         if (barW > 124) barW = 124;
@@ -230,7 +278,6 @@ void updateDisplay() {
         u8g2.printf("Hits: %u  Total: %lu",
                     presetHits[currentPresetIdx], (unsigned long)packetCount);
 
-        // Ищем первый «найденный» пресет
         int found = -1;
         for (int i = 0; i < presetCount; i++) {
             if (presetHits[i] > 0) { found = i; break; }
@@ -266,6 +313,10 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n--- LoRa Sniffer Heltec V3 ---");
+
+    // Кнопка USER (GPIO0) — active low, внутренняя подтяжка
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    buttonLastState = buttonStableState = digitalRead(BUTTON_PIN);
 
     // Питание Vext + OLED
     pinMode(VEXT_PIN, OUTPUT);
@@ -321,7 +372,7 @@ void setup() {
 
     // ---- POST /config ----
     server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (scanMode) stopScan();   // выход из сканирования при ручном изменении
+        if (scanMode) stopScan();
         if (request->hasParam("freq", true))     freq = request->getParam("freq", true)->value().toFloat();
         if (request->hasParam("bw", true))       bw   = request->getParam("bw", true)->value().toFloat();
         if (request->hasParam("sf", true))       sf   = request->getParam("sf", true)->value().toInt();
@@ -413,8 +464,8 @@ void setup() {
 
 // ---------- Loop ----------
 void loop() {
-    // Сначала обрабатываем пакет (под текущим пресетом),
-    // затем, если нужно, переключаем пресет.
+    checkButton();
+
     if (packetReceived) {
         packetReceived = false;
 
