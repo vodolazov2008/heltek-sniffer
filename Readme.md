@@ -28,8 +28,8 @@ USB-кабель для прошивки и питания.
 Клонируйте репозиторий:
 
 bash
-git clone https://github.com/your-username/lora-sniffer-heltec-v3.git
-cd lora-sniffer-heltec-v3
+git clone https://github.com/vodolazov2008/heltek-sniffer.git
+cd heltek-sniffer
 Откройте папку проекта в VS Code.
 Подключите плату к компьютеру по USB.
 Загрузите файловую систему (HTML-интерфейс):
