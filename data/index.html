@@ -14,10 +14,13 @@
         table { width: 100%; border-collapse: collapse; font-size: 12px; }
         th, td { border: 1px solid #0f0; padding: 2px 4px; text-align: left; }
         #log { height: 400px; overflow-y: auto; }
+        #status { color: #0f0; font-size: 12px; margin-bottom: 8px; }
     </style>
 </head>
 <body>
     <h1>LoRa Sniffer (Heltec V3)</h1>
+
+    <div id="status">…</div>
 
     <fieldset>
         <legend>Параметры радио</legend>
@@ -60,9 +63,10 @@
     </fieldset>
 
     <script>
-        const ws = new WebSocket(`ws://${location.host}/ws`);
         const tbody = document.getElementById('tbody');
 
+        // WebSocket
+        const ws = new WebSocket(`ws://${location.host}/ws`);
         ws.onmessage = (ev) => {
             const p = JSON.parse(ev.data);
             const row = document.createElement('tr');
@@ -71,6 +75,39 @@
             tbody.prepend(row);
             if (tbody.children.length > 200) tbody.lastChild.remove();
         };
+
+        // Загружаем текущие настройки с платы
+        async function loadConfig() {
+            try {
+                const r = await fetch('/config');
+                const c = await r.json();
+                document.getElementById('freq').value = c.freq;
+                document.getElementById('bw').value = c.bw;
+                document.getElementById('sf').value = c.sf;
+                document.getElementById('cr').value = c.cr;
+                document.getElementById('sync').value = c.sync;
+                document.getElementById('preamble').value = c.preamble;
+                document.getElementById('crc').value = c.crc;
+                document.getElementById('iq').value = c.iq;
+                updateStatus(c.packets, c.recording);
+            } catch (e) {
+                console.error('loadConfig', e);
+            }
+        }
+
+        function updateStatus(packets, recording) {
+            document.getElementById('status').textContent =
+                `Пакетов принято: ${packets}   |   Запись: ${recording ? 'REC' : 'Idle'}`;
+        }
+
+        // Периодически обновляем статус (счётчик пакетов)
+        setInterval(async () => {
+            try {
+                const r = await fetch('/config');
+                const c = await r.json();
+                updateStatus(c.packets, c.recording);
+            } catch (e) {}
+        }, 2000);
 
         function applyConfig() {
             const fd = new FormData();
@@ -83,8 +120,11 @@
             fd.append('crc', document.getElementById('crc').value);
             fd.append('iq', document.getElementById('iq').value);
             fetch('/config', { method: 'POST', body: fd })
-                .then(r => r.text()).then(t => alert(t));
+                .then(r => r.text())
+                .then(t => { alert(t); loadConfig(); });
         }
+
+        loadConfig();
     </script>
 </body>
 </html>

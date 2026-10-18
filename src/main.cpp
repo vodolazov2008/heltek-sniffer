@@ -15,8 +15,13 @@
 
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
 
-// ---------- OLED (Heltec V3: SCL=18, SDA=17, RST=21, addr 0x3C) ----------
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/18, /* data=*/17, /* reset=*/21);
+// --- OLED Configuration ---
+#define OLED_SDA 17
+#define OLED_SCL 18
+#define OLED_RST 21
+#define VEXT_PIN 36
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA);
 
 // ---------- Параметры по умолчанию ----------
 float   freq       = 868.0;
@@ -131,7 +136,15 @@ void setup() {
     delay(1000);
     Serial.println("\n--- LoRa Sniffer Heltec V3 ---");
 
-    // OLED
+    // 1. Включаем питание на дисплее (Vext)
+    // Низкий уровень (LOW) включает питание на большинстве плат Heltec V3
+    pinMode(VEXT_PIN, OUTPUT);
+    digitalWrite(VEXT_PIN, LOW);
+
+    // 2. Даём стабилизатору питания время выйти на режим
+    delay(100); 
+
+    // 3. Инициализируем дисплей
     u8g2.begin();
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
@@ -177,6 +190,24 @@ void setup() {
         }
     });
 
+        // ---- GET /config — отдаём текущие настройки клиенту ----
+    server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        doc["freq"]     = freq;
+        doc["bw"]       = bw;
+        doc["sf"]       = sf;
+        doc["cr"]       = cr;
+        doc["sync"]     = String(syncWord, HEX);
+        doc["preamble"] = preamble;
+        doc["crc"]      = crcOn ? "1" : "0";
+        doc["iq"]       = iqInverted ? "1" : "0";
+        doc["packets"]  = packetCount;
+        doc["recording"] = recording;
+        String out; serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+
+    // ---- POST /config — сохраняем и применяем ----
     server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (request->hasParam("freq", true))     freq = request->getParam("freq", true)->value().toFloat();
         if (request->hasParam("bw", true))       bw   = request->getParam("bw", true)->value().toFloat();
@@ -187,11 +218,11 @@ void setup() {
         if (request->hasParam("crc", true))      crcOn = request->getParam("crc", true)->value() == "1";
         if (request->hasParam("iq", true))       iqInverted = request->getParam("iq", true)->value() == "1";
 
-        saveConfig();          // NEW: сохраняем в NVS
+        saveConfig();
         applyRadioConfig();
         request->send(200, "text/plain", "OK");
     });
-
+    
     server.on("/record/start", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!recording) {
             dumpFile = LittleFS.open("/dump.loradump", FILE_WRITE);
