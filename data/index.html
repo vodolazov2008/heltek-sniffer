@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LoRa Sniffer</title>
+    <style>
+        body { font-family: monospace; background: #111; color: #0f0; margin: 1rem; }
+        h1 { color: #0f0; }
+        fieldset { border: 1px solid #0f0; margin-bottom: 1rem; padding: 0.5rem; }
+        label { display: inline-block; width: 100px; }
+        input, select, button { background: #222; color: #0f0; border: 1px solid #0f0; margin: 2px; }
+        button { cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th, td { border: 1px solid #0f0; padding: 2px 4px; text-align: left; }
+        #log { height: 400px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+    <h1>LoRa Sniffer (Heltec V3)</h1>
+
+    <fieldset>
+        <legend>Параметры радио</legend>
+        <label>Частота (МГц):</label><input id="freq" value="868.0"><br>
+        <label>BW (кГц):</label>
+        <select id="bw">
+            <option>125.0</option><option>250.0</option><option>500.0</option>
+        </select><br>
+        <label>SF:</label>
+        <select id="sf">
+            <option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option>
+        </select><br>
+        <label>CR (4/..):</label>
+        <select id="cr"><option>5</option><option>6</option><option>7</option><option>8</option></select><br>
+        <label>Sync word (hex):</label><input id="sync" value="12"><br>
+        <label>Preamble:</label><input id="preamble" value="8"><br>
+        <label>CRC:</label>
+        <select id="crc"><option value="1">On</option><option value="0">Off</option></select><br>
+        <label>IQ inverted:</label>
+        <select id="iq"><option value="0">Нет</option><option value="1">Да</option></select><br>
+        <button onclick="applyConfig()">Применить</button>
+    </fieldset>
+
+    <fieldset>
+        <legend>Запись</legend>
+        <button onclick="fetch('/record/start',{method:'POST'})">Начать запись</button>
+        <button onclick="fetch('/record/stop',{method:'POST'})">Остановить</button>
+        <a href="/download"><button>Скачать дамп</button></a>
+        <button onclick="fetch('/clear',{method:'POST'}).then(()=>location.reload())">Очистить</button>
+    </fieldset>
+
+    <fieldset>
+        <legend>Последние пакеты</legend>
+        <div id="log">
+            <table>
+                <thead><tr><th>Время (мс)</th><th>RSSI</th><th>SNR</th><th>Len</th><th>ASCII</th><th>HEX</th></tr></thead>
+                <tbody id="tbody"></tbody>
+            </table>
+        </div>
+    </fieldset>
+
+    <script>
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        const tbody = document.getElementById('tbody');
+
+        ws.onmessage = (ev) => {
+            const p = JSON.parse(ev.data);
+            const row = document.createElement('tr');
+            row.innerHTML = `<td>${p.t}</td><td>${p.rssi.toFixed(1)}</td><td>${p.snr.toFixed(1)}</td>
+                             <td>${p.len}</td><td>${p.ascii}</td><td>${p.hex}</td>`;
+            tbody.prepend(row);
+            if (tbody.children.length > 200) tbody.lastChild.remove();
+        };
+
+        function applyConfig() {
+            const fd = new FormData();
+            fd.append('freq', document.getElementById('freq').value);
+            fd.append('bw', document.getElementById('bw').value);
+            fd.append('sf', document.getElementById('sf').value);
+            fd.append('cr', document.getElementById('cr').value);
+            fd.append('sync', document.getElementById('sync').value);
+            fd.append('preamble', document.getElementById('preamble').value);
+            fd.append('crc', document.getElementById('crc').value);
+            fd.append('iq', document.getElementById('iq').value);
+            fetch('/config', { method: 'POST', body: fd })
+                .then(r => r.text()).then(t => alert(t));
+        }
+    </script>
+</body>
+</html>
