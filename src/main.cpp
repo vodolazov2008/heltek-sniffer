@@ -4,8 +4,8 @@
 #include <LittleFS.h>
 #include <RadioLib.h>
 #include <ArduinoJson.h>
-#include <Preferences.h>      // NEW: для сохранения настроек
-#include <U8g2lib.h>         // NEW: для OLED
+#include <Preferences.h>
+#include <U8g2lib.h>
 
 // ---------- Пины SX1262 ----------
 #define LORA_NSS   8
@@ -15,13 +15,13 @@
 
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
 
-// --- OLED Configuration ---
+// ---------- OLED ----------
 #define OLED_SDA 17
 #define OLED_SCL 18
 #define OLED_RST 21
 #define VEXT_PIN 36
 
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
 
 // ---------- Параметры по умолчанию ----------
 float   freq       = 868.0;
@@ -43,7 +43,7 @@ AsyncWebSocket ws("/ws");
 volatile bool packetReceived = false;
 bool recording = false;
 File dumpFile;
-uint32_t packetCount = 0;      // NEW: общий счётчик принятых пакетов
+uint32_t packetCount = 0;
 
 const int MAX_PACKETS = 50;
 struct Packet {
@@ -56,11 +56,59 @@ struct Packet {
 Packet packets[MAX_PACKETS];
 int packetIndex = 0;
 
+// ---------- Режим сканирования ----------
+#define PRESET_DURATION_MS 15000
+#define MAX_PRESETS 32
+
+struct Preset {
+    const char* name;
+    float   freq;
+    float   bw;
+    uint8_t sf;
+    uint8_t sync;
+};
+
+// Пресеты. При необходимости расширяйте — лимит MAX_PRESETS.
+const Preset presets[] = {
+    // LoRaWAN EU868 (sync 0x34)
+    {"LW 868.1 SF7",  868.1, 125.0,  7, 0x34},
+    {"LW 868.1 SF9",  868.1, 125.0,  9, 0x34},
+    {"LW 868.1 SF12", 868.1, 125.0, 12, 0x34},
+    {"LW 868.3 SF7",  868.3, 125.0,  7, 0x34},
+    {"LW 868.3 SF12", 868.3, 125.0, 12, 0x34},
+    {"LW 868.5 SF7",  868.5, 125.0,  7, 0x34},
+    {"LW 868.5 SF12", 868.5, 125.0, 12, 0x34},
+    // Meshtastic EU868 (sync 0x2B, BW 250)
+    {"MT 869.5 SF11", 869.525, 250.0, 11, 0x2B},
+    {"MT 869.5 SF9",  869.525, 250.0,  9, 0x2B},
+    // Приватные сети (sync 0x12)
+    {"PV 868 SF7",    868.0, 125.0,  7, 0x12},
+    {"PV 868 SF9",    868.0, 125.0,  9, 0x12},
+    {"PV 868 SF12",   868.0, 125.0, 12, 0x12},
+    {"PV 433 SF7",    433.0, 125.0,  7, 0x12},
+    {"PV 433 SF12",   433.0, 125.0, 12, 0x12},
+    {"PV 915 SF7",    915.0, 125.0,  7, 0x12},
+};
+const int presetCount = sizeof(presets) / sizeof(presets[0]);
+
+bool scanMode = false;
+int  currentPresetIdx = -1;
+uint32_t presetStartTime = 0;
+uint16_t presetHits[MAX_PRESETS] = {0};
+
+// Сохранённые пользовательские настройки на время сканирования
+float   savedFreq;
+float   savedBw;
+uint8_t savedSf, savedCr, savedSync;
+uint16_t savedPreamble;
+bool    savedCrc, savedIq;
+
+// ---------- Прерывание DIO1 ----------
 void IRAM_ATTR onDio1() {
     packetReceived = true;
 }
 
-// ---------- Сохранение / загрузка настроек ----------
+// ---------- NVS ----------
 void saveConfig() {
     prefs.begin(NVS_NAMESPACE, false);
     prefs.putFloat("freq", freq);
@@ -87,7 +135,7 @@ void loadConfig() {
     prefs.end();
 }
 
-// ---------- Настройка радио ----------
+// ---------- Применение настроек радио ----------
 void applyRadioConfig() {
     radio.standby();
     radio.setFrequency(freq);
@@ -97,10 +145,66 @@ void applyRadioConfig() {
     radio.setSyncWord(syncWord);
     radio.setPreambleLength(preamble);
     radio.setCRC(crcOn);
-    radio.invertIQ(iqInverted);   // было setIQ, исправлено ранее
+    radio.invertIQ(iqInverted);
     radio.startReceive();
     Serial.printf("Radio: %.1f MHz, BW=%.1f, SF=%d, CR=4/%d, Sync=0x%02X\n",
                   freq, bw, sf, cr, syncWord);
+}
+
+// ---------- Сканирование ----------
+void applyPreset(int idx) {
+    if (idx < 0 || idx >= presetCount) return;
+    const Preset &p = presets[idx];
+    packetReceived = false;      // сброс возможного «зависшего» IRQ
+    radio.standby();
+    radio.setFrequency(p.freq);
+    radio.setBandwidth(p.bw);
+    radio.setSpreadingFactor(p.sf);
+    radio.setCodingRate(5);       // 4/5
+    radio.setSyncWord(p.sync);
+    radio.setPreambleLength(8);
+    radio.setCRC(true);
+    radio.invertIQ(false);
+    radio.startReceive();
+    Serial.printf("Scan preset %d/%d: %s\n", idx + 1, presetCount, p.name);
+}
+
+void startScan() {
+    if (scanMode) return;
+    // Сохраняем текущие настройки пользователя
+    savedFreq = freq; savedBw = bw; savedSf = sf; savedCr = cr;
+    savedSync = syncWord; savedPreamble = preamble;
+    savedCrc = crcOn; savedIq = iqInverted;
+
+    memset(presetHits, 0, sizeof(presetHits));
+    scanMode = true;
+    currentPresetIdx = 0;
+    presetStartTime = millis();
+    applyPreset(0);
+    Serial.println("Scan mode STARTED");
+}
+
+void stopScan() {
+    if (!scanMode) return;
+    scanMode = false;
+    int lastIdx = currentPresetIdx;
+    currentPresetIdx = -1;
+
+    // Восстанавливаем пользовательские настройки
+    freq = savedFreq; bw = savedBw; sf = savedSf; cr = savedCr;
+    syncWord = savedSync; preamble = savedPreamble;
+    crcOn = savedCrc; iqInverted = savedIq;
+    applyRadioConfig();
+    Serial.printf("Scan mode STOPPED (last preset idx=%d)\n", lastIdx);
+}
+
+void checkScanTimer() {
+    if (!scanMode) return;
+    if (millis() - presetStartTime >= PRESET_DURATION_MS) {
+        currentPresetIdx = (currentPresetIdx + 1) % presetCount;
+        presetStartTime = millis();
+        applyPreset(currentPresetIdx);
+    }
 }
 
 // ---------- OLED ----------
@@ -108,23 +212,50 @@ void updateDisplay() {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
 
-    u8g2.setCursor(0, 10);
-    u8g2.print("LoRa Sniffer V3");
+    if (scanMode && currentPresetIdx >= 0) {
+        u8g2.setCursor(0, 10);
+        u8g2.printf("SCAN %d/%d", currentPresetIdx + 1, presetCount);
 
-    u8g2.setCursor(0, 24);
-    u8g2.printf("Pkts: %lu", (unsigned long)packetCount);
+        u8g2.setCursor(0, 24);
+        u8g2.print(presets[currentPresetIdx].name);
 
-    u8g2.setCursor(0, 38);
-    u8g2.printf("IP: %s", WiFi.softAPIP().toString().c_str());
+        // Прогресс-бар
+        uint32_t elapsed = millis() - presetStartTime;
+        int barW = (int)(elapsed * 124 / PRESET_DURATION_MS);
+        if (barW > 124) barW = 124;
+        u8g2.drawFrame(0, 28, 128, 6);
+        if (barW > 0) u8g2.drawBox(2, 30, barW, 2);
 
-    u8g2.setCursor(0, 52);
-    u8g2.printf("SF%d BW%.0f", sf, bw);
+        u8g2.setCursor(0, 46);
+        u8g2.printf("Hits: %u  Total: %lu",
+                    presetHits[currentPresetIdx], (unsigned long)packetCount);
 
-    u8g2.setCursor(0, 64);
-    if (recording) {
-        u8g2.print("REC");
+        // Ищем первый «найденный» пресет
+        int found = -1;
+        for (int i = 0; i < presetCount; i++) {
+            if (presetHits[i] > 0) { found = i; break; }
+        }
+        u8g2.setCursor(0, 60);
+        if (found >= 0) {
+            u8g2.printf("Found: %s", presets[found].name);
+        } else {
+            u8g2.printf("No hits yet");
+        }
     } else {
-        u8g2.print("Idle");
+        u8g2.setCursor(0, 10);
+        u8g2.print("LoRa Sniffer V3");
+
+        u8g2.setCursor(0, 24);
+        u8g2.printf("Pkts: %lu", (unsigned long)packetCount);
+
+        u8g2.setCursor(0, 38);
+        u8g2.printf("IP: %s", WiFi.softAPIP().toString().c_str());
+
+        u8g2.setCursor(0, 52);
+        u8g2.printf("SF%d BW%.0f", sf, bw);
+
+        u8g2.setCursor(0, 64);
+        u8g2.print(recording ? "REC" : "Idle");
     }
 
     u8g2.sendBuffer();
@@ -136,15 +267,11 @@ void setup() {
     delay(1000);
     Serial.println("\n--- LoRa Sniffer Heltec V3 ---");
 
-    // 1. Включаем питание на дисплее (Vext)
-    // Низкий уровень (LOW) включает питание на большинстве плат Heltec V3
+    // Питание Vext + OLED
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, LOW);
+    delay(100);
 
-    // 2. Даём стабилизатору питания время выйти на режим
-    delay(100); 
-
-    // 3. Инициализируем дисплей
     u8g2.begin();
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
@@ -152,15 +279,12 @@ void setup() {
     u8g2.print("Booting...");
     u8g2.sendBuffer();
 
-    // LittleFS
     if (!LittleFS.begin(true)) {
         Serial.println("LittleFS mount failed");
     }
 
-    // Загружаем сохранённые настройки
     loadConfig();
 
-    // Радио
     int state = radio.begin();
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("Radio init failed: %d\n", state);
@@ -177,38 +301,27 @@ void setup() {
     WiFi.softAP("LoRaSniffer", "sniffer123");
     Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
 
-    // Веб-сервер
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(LittleFS, "/index.html", "text/html");
-    });
-
-    server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (LittleFS.exists("/dump.loradump")) {
-            request->send(LittleFS, "/dump.loradump", "application/octet-stream", true);
-        } else {
-            request->send(404, "text/plain", "No dump");
-        }
-    });
-
-        // ---- GET /config — отдаём текущие настройки клиенту ----
+    // ---- GET /config ----
     server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request) {
         JsonDocument doc;
-        doc["freq"]     = freq;
-        doc["bw"]       = bw;
-        doc["sf"]       = sf;
-        doc["cr"]       = cr;
-        doc["sync"]     = String(syncWord, HEX);
-        doc["preamble"] = preamble;
-        doc["crc"]      = crcOn ? "1" : "0";
-        doc["iq"]       = iqInverted ? "1" : "0";
-        doc["packets"]  = packetCount;
+        doc["freq"]      = freq;
+        doc["bw"]        = bw;
+        doc["sf"]        = sf;
+        doc["cr"]        = cr;
+        doc["sync"]      = String(syncWord, HEX);
+        doc["preamble"]  = preamble;
+        doc["crc"]       = crcOn ? "1" : "0";
+        doc["iq"]        = iqInverted ? "1" : "0";
+        doc["packets"]   = packetCount;
         doc["recording"] = recording;
+        doc["scanning"]  = scanMode;
         String out; serializeJson(doc, out);
         request->send(200, "application/json", out);
     });
 
-    // ---- POST /config — сохраняем и применяем ----
+    // ---- POST /config ----
     server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (scanMode) stopScan();   // выход из сканирования при ручном изменении
         if (request->hasParam("freq", true))     freq = request->getParam("freq", true)->value().toFloat();
         if (request->hasParam("bw", true))       bw   = request->getParam("bw", true)->value().toFloat();
         if (request->hasParam("sf", true))       sf   = request->getParam("sf", true)->value().toInt();
@@ -217,12 +330,46 @@ void setup() {
         if (request->hasParam("preamble", true)) preamble = request->getParam("preamble", true)->value().toInt();
         if (request->hasParam("crc", true))      crcOn = request->getParam("crc", true)->value() == "1";
         if (request->hasParam("iq", true))       iqInverted = request->getParam("iq", true)->value() == "1";
-
         saveConfig();
         applyRadioConfig();
         request->send(200, "text/plain", "OK");
     });
-    
+
+    // ---- Сканирование ----
+    server.on("/scan/start", HTTP_POST, [](AsyncWebServerRequest *request) {
+        startScan();
+        request->send(200, "text/plain", "Scan started");
+    });
+
+    server.on("/scan/stop", HTTP_POST, [](AsyncWebServerRequest *request) {
+        stopScan();
+        request->send(200, "text/plain", "Scan stopped");
+    });
+
+    server.on("/scan/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        doc["active"]  = scanMode;
+        doc["current"] = currentPresetIdx;
+        doc["total"]   = presetCount;
+        doc["elapsed"] = scanMode ? (millis() - presetStartTime) : 0;
+        doc["duration"] = PRESET_DURATION_MS;
+
+        JsonArray arr = doc["presets"].to<JsonArray>();
+        for (int i = 0; i < presetCount; i++) {
+            JsonObject p = arr.add<JsonObject>();
+            p["name"] = presets[i].name;
+            p["freq"] = presets[i].freq;
+            p["bw"]   = presets[i].bw;
+            p["sf"]   = presets[i].sf;
+            p["sync"] = String(presets[i].sync, HEX);
+            p["hits"] = presetHits[i];
+        }
+
+        String out; serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+
+    // ---- Запись ----
     server.on("/record/start", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!recording) {
             dumpFile = LittleFS.open("/dump.loradump", FILE_WRITE);
@@ -245,9 +392,19 @@ void setup() {
         request->send(200, "text/plain", "Cleared");
     });
 
-    ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-        // ничего не делаем с входящими сообщениями
+    server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (LittleFS.exists("/dump.loradump")) {
+            request->send(LittleFS, "/dump.loradump", "application/octet-stream", true);
+        } else {
+            request->send(404, "text/plain", "No dump");
+        }
     });
+
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(LittleFS, "/index.html", "text/html");
+    });
+
+    ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {});
     server.addHandler(&ws);
     server.begin();
 
@@ -256,6 +413,8 @@ void setup() {
 
 // ---------- Loop ----------
 void loop() {
+    // Сначала обрабатываем пакет (под текущим пресетом),
+    // затем, если нужно, переключаем пресет.
     if (packetReceived) {
         packetReceived = false;
 
@@ -266,9 +425,13 @@ void loop() {
             float rssi = radio.getRSSI();
             float snr  = radio.getSNR();
 
-            packetCount++;     // NEW: увеличиваем счётчик
+            packetCount++;
+            if (scanMode && currentPresetIdx >= 0) {
+                if (presetHits[currentPresetIdx] < 0xFFFF) {
+                    presetHits[currentPresetIdx]++;
+                }
+            }
 
-            // Кольцевой буфер
             Packet &p = packets[packetIndex % MAX_PACKETS];
             p.timeMs = millis();
             p.rssi = rssi;
@@ -277,26 +440,28 @@ void loop() {
             memcpy(p.data, buf, len);
             packetIndex++;
 
-            // JSON для WebSocket
             JsonDocument doc;
-            doc["t"] = p.timeMs;
+            doc["t"]    = p.timeMs;
             doc["rssi"] = p.rssi;
-            doc["snr"] = p.snr;
-            doc["len"] = p.len;
+            doc["snr"]  = p.snr;
+            doc["len"]  = p.len;
+            if (scanMode) doc["scan"] = currentPresetIdx;
+
             String hex = "";
             for (size_t i = 0; i < len; i++) {
                 char h[3]; sprintf(h, "%02X", buf[i]); hex += h;
             }
             doc["hex"] = hex;
+
             String ascii = "";
             for (size_t i = 0; i < len; i++) {
                 ascii += (buf[i] >= 32 && buf[i] < 127) ? (char)buf[i] : '.';
             }
             doc["ascii"] = ascii;
+
             String out; serializeJson(doc, out);
             ws.textAll(out);
 
-            // Запись в файл
             if (recording) {
                 uint32_t t = p.timeMs;
                 dumpFile.write((uint8_t*)&t, 4);
@@ -306,10 +471,11 @@ void loop() {
                 dumpFile.write(buf, len);
             }
         }
-        radio.startReceive(); // возвращаемся в RX
+        radio.startReceive();
     }
 
-    // Периодическое обновление OLED (раз в ~500 мс)
+    checkScanTimer();
+
     static uint32_t lastDisplay = 0;
     if (millis() - lastDisplay > 500) {
         lastDisplay = millis();

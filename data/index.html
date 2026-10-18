@@ -11,10 +11,15 @@
         label { display: inline-block; width: 100px; }
         input, select, button { background: #222; color: #0f0; border: 1px solid #0f0; margin: 2px; }
         button { cursor: pointer; }
+        button:disabled, input:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
         table { width: 100%; border-collapse: collapse; font-size: 12px; }
         th, td { border: 1px solid #0f0; padding: 2px 4px; text-align: left; }
-        #log { height: 400px; overflow-y: auto; }
+        #log { height: 300px; overflow-y: auto; }
         #status { color: #0f0; font-size: 12px; margin-bottom: 8px; }
+        .scan-row-current { background: #252; font-weight: bold; }
+        .scan-row-hit { background: #333; color: #ff0; }
+        #scanProgress { width: 100%; height: 8px; border: 1px solid #0f0; margin-top: 4px; }
+        #scanProgressBar { height: 100%; background: #0f0; width: 0%; transition: width 0.2s; }
     </style>
 </head>
 <body>
@@ -23,6 +28,14 @@
     <div id="status">…</div>
 
     <fieldset>
+        <legend>Режим сканирования</legend>
+        <button id="scanBtn" onclick="toggleScan()">Начать сканирование</button>
+        <div id="scanStatus" style="margin-top:8px; font-size:12px;"></div>
+        <div id="scanProgress"><div id="scanProgressBar"></div></div>
+        <div id="scanList" style="margin-top:8px;"></div>
+    </fieldset>
+
+    <fieldset id="configFieldset">
         <legend>Параметры радио</legend>
         <label>Частота (МГц):</label><input id="freq" value="868.0"><br>
         <label>BW (кГц):</label>
@@ -65,7 +78,6 @@
     <script>
         const tbody = document.getElementById('tbody');
 
-        // WebSocket
         const ws = new WebSocket(`ws://${location.host}/ws`);
         ws.onmessage = (ev) => {
             const p = JSON.parse(ev.data);
@@ -76,7 +88,6 @@
             if (tbody.children.length > 200) tbody.lastChild.remove();
         };
 
-        // Загружаем текущие настройки с платы
         async function loadConfig() {
             try {
                 const r = await fetch('/config');
@@ -89,25 +100,89 @@
                 document.getElementById('preamble').value = c.preamble;
                 document.getElementById('crc').value = c.crc;
                 document.getElementById('iq').value = c.iq;
-                updateStatus(c.packets, c.recording);
+                updateStatus(c.packets, c.recording, c.scanning);
             } catch (e) {
                 console.error('loadConfig', e);
             }
         }
 
-        function updateStatus(packets, recording) {
+        function updateStatus(packets, recording, scanning) {
             document.getElementById('status').textContent =
-                `Пакетов принято: ${packets}   |   Запись: ${recording ? 'REC' : 'Idle'}`;
+                `Пакетов: ${packets} | Запись: ${recording ? 'REC' : 'Idle'} | Сканирование: ${scanning ? 'ON' : 'OFF'}`;
         }
 
-        // Периодически обновляем статус (счётчик пакетов)
-        setInterval(async () => {
+        let scanActive = false;
+        let scanRefreshTimer = null;
+
+        async function toggleScan() {
+            if (scanActive) {
+                await fetch('/scan/stop', {method:'POST'});
+            } else {
+                await fetch('/scan/start', {method:'POST'});
+            }
+            await refreshScanStatus();
+            await loadConfig();
+        }
+
+        async function refreshScanStatus() {
             try {
-                const r = await fetch('/config');
-                const c = await r.json();
-                updateStatus(c.packets, c.recording);
-            } catch (e) {}
-        }, 2000);
+                const r = await fetch('/scan/status');
+                const s = await r.json();
+                scanActive = s.active;
+
+                document.getElementById('scanBtn').textContent =
+                    scanActive ? 'Остановить сканирование' : 'Начать сканирование';
+
+                // Блокировка формы конфига во время сканирования
+                const ids = ['freq','bw','sf','cr','sync','preamble','crc','iq'];
+                ids.forEach(id => document.getElementById(id).disabled = scanActive);
+
+                if (scanActive) {
+                    const pct = Math.min(100, Math.floor(s.elapsed * 100 / s.duration));
+                    const cur = s.presets[s.current];
+                    document.getElementById('scanStatus').innerHTML =
+                        `Пресет <b>${s.current + 1}/${s.total}</b>: ${cur.name}<br>` +
+                        `Пакетов на этом пресете: <b>${cur.hits}</b>`;
+                    document.getElementById('scanProgressBar').style.width = pct + '%';
+
+                    let html = '<table style="font-size:11px">' +
+                        '<tr><th>#</th><th>Пресет</th><th>МГц</th><th>BW</th><th>SF</th><th>Sync</th><th>Хиты</th></tr>';
+                    for (let i = 0; i < s.presets.length; i++) {
+                        const p = s.presets[i];
+                        let cls = '';
+                        if (i === s.current) cls = 'scan-row-current';
+                        else if (p.hits > 0) cls = 'scan-row-hit';
+                        html += `<tr class="${cls}"><td>${i+1}</td><td>${p.name}</td>` +
+                                `<td>${p.freq}</td><td>${p.bw}</td><td>${p.sf}</td>` +
+                                `<td>0x${p.sync}</td><td>${p.hits}</td></tr>`;
+                    }
+                    html += '</table>';
+                    document.getElementById('scanList').innerHTML = html;
+                } else {
+                    document.getElementById('scanStatus').innerHTML = '';
+                    document.getElementById('scanProgressBar').style.width = '0%';
+
+                    // При выходе из сканирования показываем итоговую сводку
+                    let hitCount = 0;
+                    let summary = '<table style="font-size:11px"><tr><th>Пресет</th><th>Найдено пакетов</th></tr>';
+                    for (let i = 0; i < s.presets.length; i++) {
+                        if (s.presets[i].hits > 0) {
+                            hitCount++;
+                            summary += `<tr class="scan-row-hit"><td>${s.presets[i].name}</td><td>${s.presets[i].hits}</td></tr>`;
+                        }
+                    }
+                    summary += '</table>';
+                    if (hitCount > 0) {
+                        document.getElementById('scanList').innerHTML =
+                            '<b>Найдено пресетов: ' + hitCount + '</b>' + summary;
+                    } else {
+                        document.getElementById('scanList').innerHTML = '';
+                    }
+                }
+            } catch (e) {
+                console.error('refreshScanStatus', e);
+            }
+        }
 
         function applyConfig() {
             const fd = new FormData();
@@ -121,10 +196,14 @@
             fd.append('iq', document.getElementById('iq').value);
             fetch('/config', { method: 'POST', body: fd })
                 .then(r => r.text())
-                .then(t => { alert(t); loadConfig(); });
+                .then(t => { alert(t); loadConfig(); refreshScanStatus(); });
         }
 
+        // Первичная загрузка + периодическое обновление
         loadConfig();
+        refreshScanStatus();
+        setInterval(loadConfig, 3000);
+        setInterval(refreshScanStatus, 1000);
     </script>
 </body>
 </html>
