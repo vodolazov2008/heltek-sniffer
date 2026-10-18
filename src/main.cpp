@@ -4,27 +4,33 @@
 #include <LittleFS.h>
 #include <RadioLib.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>      // NEW: для сохранения настроек
+#include <U8g2lib.h>         // NEW: для OLED
 
-// ---------- Пины SX1262 на Heltec WiFi LoRa 32 V3 ----------
+// ---------- Пины SX1262 ----------
 #define LORA_NSS   8
 #define LORA_DIO1  14
 #define LORA_NRST  12
 #define LORA_BUSY  13
-#define LORA_SCK   9
-#define LORA_MISO  11
-#define LORA_MOSI  10
 
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
 
+// ---------- OLED (Heltec V3: SCL=18, SDA=17, RST=21, addr 0x3C) ----------
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/18, /* data=*/17, /* reset=*/21);
+
 // ---------- Параметры по умолчанию ----------
-float  freq     = 868.0;   // МГц
-float  bw       = 125.0;   // кГц
-uint8_t sf      = 7;
-uint8_t cr      = 5;       // 4/5
-uint8_t syncWord = 0x12;
-uint16_t preamble = 8;
-bool    crcOn   = true;
+float   freq       = 868.0;
+float   bw         = 125.0;
+uint8_t sf         = 7;
+uint8_t cr         = 5;
+uint8_t syncWord   = 0x12;
+uint16_t preamble  = 8;
+bool    crcOn      = true;
 bool    iqInverted = false;
+
+// ---------- NVS ----------
+Preferences prefs;
+const char* NVS_NAMESPACE = "lorasniff";
 
 // ---------- Состояние ----------
 AsyncWebServer server(80);
@@ -32,8 +38,9 @@ AsyncWebSocket ws("/ws");
 volatile bool packetReceived = false;
 bool recording = false;
 File dumpFile;
+uint32_t packetCount = 0;      // NEW: общий счётчик принятых пакетов
 
-const int MAX_PACKETS = 50;   // сколько последних пакетов храним в памяти для веб-таблицы
+const int MAX_PACKETS = 50;
 struct Packet {
     uint32_t timeMs;
     float rssi;
@@ -44,9 +51,35 @@ struct Packet {
 Packet packets[MAX_PACKETS];
 int packetIndex = 0;
 
-// ---------- Прерывание DIO1 ----------
 void IRAM_ATTR onDio1() {
     packetReceived = true;
+}
+
+// ---------- Сохранение / загрузка настроек ----------
+void saveConfig() {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putFloat("freq", freq);
+    prefs.putFloat("bw", bw);
+    prefs.putUChar("sf", sf);
+    prefs.putUChar("cr", cr);
+    prefs.putUChar("sync", syncWord);
+    prefs.putUShort("preamble", preamble);
+    prefs.putBool("crc", crcOn);
+    prefs.putBool("iq", iqInverted);
+    prefs.end();
+}
+
+void loadConfig() {
+    prefs.begin(NVS_NAMESPACE, true);
+    freq       = prefs.getFloat("freq", freq);
+    bw         = prefs.getFloat("bw", bw);
+    sf         = prefs.getUChar("sf", sf);
+    cr         = prefs.getUChar("cr", cr);
+    syncWord   = prefs.getUChar("sync", syncWord);
+    preamble   = prefs.getUShort("preamble", preamble);
+    crcOn      = prefs.getBool("crc", crcOn);
+    iqInverted = prefs.getBool("iq", iqInverted);
+    prefs.end();
 }
 
 // ---------- Настройка радио ----------
@@ -59,23 +92,60 @@ void applyRadioConfig() {
     radio.setSyncWord(syncWord);
     radio.setPreambleLength(preamble);
     radio.setCRC(crcOn);
-    //radio.setIQ(iqInverted);
-    radio.invertIQ(iqInverted);
+    radio.invertIQ(iqInverted);   // было setIQ, исправлено ранее
     radio.startReceive();
     Serial.printf("Radio: %.1f MHz, BW=%.1f, SF=%d, CR=4/%d, Sync=0x%02X\n",
                   freq, bw, sf, cr, syncWord);
 }
 
-// ---------- Инициализация ----------
+// ---------- OLED ----------
+void updateDisplay() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    u8g2.setCursor(0, 10);
+    u8g2.print("LoRa Sniffer V3");
+
+    u8g2.setCursor(0, 24);
+    u8g2.printf("Pkts: %lu", (unsigned long)packetCount);
+
+    u8g2.setCursor(0, 38);
+    u8g2.printf("IP: %s", WiFi.softAPIP().toString().c_str());
+
+    u8g2.setCursor(0, 52);
+    u8g2.printf("SF%d BW%.0f", sf, bw);
+
+    u8g2.setCursor(0, 64);
+    if (recording) {
+        u8g2.print("REC");
+    } else {
+        u8g2.print("Idle");
+    }
+
+    u8g2.sendBuffer();
+}
+
+// ---------- Setup ----------
 void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n--- LoRa Sniffer Heltec V3 ---");
 
+    // OLED
+    u8g2.begin();
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor(0, 10);
+    u8g2.print("Booting...");
+    u8g2.sendBuffer();
+
     // LittleFS
     if (!LittleFS.begin(true)) {
         Serial.println("LittleFS mount failed");
     }
+
+    // Загружаем сохранённые настройки
+    loadConfig();
 
     // Радио
     int state = radio.begin();
@@ -86,7 +156,7 @@ void setup() {
     radio.setDio1Action(onDio1);
     applyRadioConfig();
 
-    // SoftAP + DHCP
+    // SoftAP
     IPAddress local_ip(192, 168, 0, 1);
     IPAddress gateway(192, 168, 0, 1);
     IPAddress subnet(255, 255, 255, 0);
@@ -108,14 +178,16 @@ void setup() {
     });
 
     server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (request->hasParam("freq", true)) freq = request->getParam("freq", true)->value().toFloat();
-        if (request->hasParam("bw", true))   bw   = request->getParam("bw", true)->value().toFloat();
-        if (request->hasParam("sf", true))   sf   = request->getParam("sf", true)->value().toInt();
-        if (request->hasParam("cr", true))   cr   = request->getParam("cr", true)->value().toInt();
-        if (request->hasParam("sync", true)) syncWord = strtol(request->getParam("sync", true)->value().c_str(), nullptr, 16);
+        if (request->hasParam("freq", true))     freq = request->getParam("freq", true)->value().toFloat();
+        if (request->hasParam("bw", true))       bw   = request->getParam("bw", true)->value().toFloat();
+        if (request->hasParam("sf", true))       sf   = request->getParam("sf", true)->value().toInt();
+        if (request->hasParam("cr", true))       cr   = request->getParam("cr", true)->value().toInt();
+        if (request->hasParam("sync", true))     syncWord = strtol(request->getParam("sync", true)->value().c_str(), nullptr, 16);
         if (request->hasParam("preamble", true)) preamble = request->getParam("preamble", true)->value().toInt();
-        if (request->hasParam("crc", true))  crcOn = request->getParam("crc", true)->value() == "1";
-        if (request->hasParam("iq", true))   iqInverted = request->getParam("iq", true)->value() == "1";
+        if (request->hasParam("crc", true))      crcOn = request->getParam("crc", true)->value() == "1";
+        if (request->hasParam("iq", true))       iqInverted = request->getParam("iq", true)->value() == "1";
+
+        saveConfig();          // NEW: сохраняем в NVS
         applyRadioConfig();
         request->send(200, "text/plain", "OK");
     });
@@ -143,13 +215,15 @@ void setup() {
     });
 
     ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-        // не требуется обработка входящих сообщений
+        // ничего не делаем с входящими сообщениями
     });
     server.addHandler(&ws);
     server.begin();
+
+    updateDisplay();
 }
 
-// ---------- Основной цикл ----------
+// ---------- Loop ----------
 void loop() {
     if (packetReceived) {
         packetReceived = false;
@@ -161,7 +235,9 @@ void loop() {
             float rssi = radio.getRSSI();
             float snr  = radio.getSNR();
 
-            // Сохраняем в кольцевой буфер
+            packetCount++;     // NEW: увеличиваем счётчик
+
+            // Кольцевой буфер
             Packet &p = packets[packetIndex % MAX_PACKETS];
             p.timeMs = millis();
             p.rssi = rssi;
@@ -170,7 +246,7 @@ void loop() {
             memcpy(p.data, buf, len);
             packetIndex++;
 
-            // Отправляем JSON через WebSocket
+            // JSON для WebSocket
             JsonDocument doc;
             doc["t"] = p.timeMs;
             doc["rssi"] = p.rssi;
@@ -199,7 +275,14 @@ void loop() {
                 dumpFile.write(buf, len);
             }
         }
-        radio.startReceive(); // снова в RX
+        radio.startReceive(); // возвращаемся в RX
+    }
+
+    // Периодическое обновление OLED (раз в ~500 мс)
+    static uint32_t lastDisplay = 0;
+    if (millis() - lastDisplay > 500) {
+        lastDisplay = millis();
+        updateDisplay();
     }
 
     ws.cleanupClients();
