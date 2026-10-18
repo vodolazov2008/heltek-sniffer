@@ -77,7 +77,13 @@
 
     <script>
         const tbody = document.getElementById('tbody');
+        const CONFIG_FIELDS = ['freq','bw','sf','cr','sync','preamble','crc','iq'];
 
+        // Флаг: пользователь менял поля и они ещё не отправлены на плату.
+        // Пока true — периодическое обновление статуса НЕ трогает поля ввода.
+        let formDirty = false;
+
+        // ----- WebSocket -----
         const ws = new WebSocket(`ws://${location.host}/ws`);
         ws.onmessage = (ev) => {
             const p = JSON.parse(ev.data);
@@ -88,31 +94,74 @@
             if (tbody.children.length > 200) tbody.lastChild.remove();
         };
 
-        async function loadConfig() {
+        // ----- Заполнение формы из ответа /config -----
+        function fillForm(c) {
+            document.getElementById('freq').value     = c.freq;
+            document.getElementById('bw').value       = c.bw;
+            document.getElementById('sf').value       = c.sf;
+            document.getElementById('cr').value       = c.cr;
+            document.getElementById('sync').value     = c.sync;
+            document.getElementById('preamble').value = c.preamble;
+            document.getElementById('crc').value      = c.crc;
+            document.getElementById('iq').value       = c.iq;
+        }
+
+        function updateStatus(c) {
+            document.getElementById('status').textContent =
+                `Пакетов: ${c.packets} | Запись: ${c.recording ? 'REC' : 'Idle'} | Сканирование: ${c.scanning ? 'ON' : 'OFF'}`;
+
+            // Блокировка полей во время сканирования
+            CONFIG_FIELDS.forEach(id => document.getElementById(id).disabled = c.scanning);
+        }
+
+        // Первичная загрузка — заполняем поля и статус
+        async function initialLoad() {
             try {
                 const r = await fetch('/config');
                 const c = await r.json();
-                document.getElementById('freq').value = c.freq;
-                document.getElementById('bw').value = c.bw;
-                document.getElementById('sf').value = c.sf;
-                document.getElementById('cr').value = c.cr;
-                document.getElementById('sync').value = c.sync;
-                document.getElementById('preamble').value = c.preamble;
-                document.getElementById('crc').value = c.crc;
-                document.getElementById('iq').value = c.iq;
-                updateStatus(c.packets, c.recording, c.scanning);
+                fillForm(c);
+                updateStatus(c);
+            } catch (e) { console.error('initialLoad', e); }
+        }
+
+        // Периодическое обновление — только статус, поля не трогаем
+        async function refreshStatus() {
+            try {
+                const r = await fetch('/config');
+                const c = await r.json();
+                updateStatus(c);
+            } catch (e) { /* молча */ }
+        }
+
+        // Отслеживаем изменения в полях — чтобы не перетирать их
+        CONFIG_FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('input',  () => { formDirty = true; });
+            el.addEventListener('change', () => { formDirty = true; });
+        });
+
+        // ----- Применение конфигурации -----
+        async function applyConfig() {
+            const fd = new FormData();
+            CONFIG_FIELDS.forEach(id => fd.append(id, document.getElementById(id).value));
+
+            try {
+                const r = await fetch('/config', { method: 'POST', body: fd });
+                const t = await r.text();
+                alert(t);
+                formDirty = false;                 // сброс флага
+                // После сохранения — подтягиваем актуальные значения с платы
+                const r2 = await fetch('/config');
+                const c2 = await r2.json();
+                fillForm(c2);
+                updateStatus(c2);
             } catch (e) {
-                console.error('loadConfig', e);
+                alert('Ошибка: ' + e);
             }
         }
 
-        function updateStatus(packets, recording, scanning) {
-            document.getElementById('status').textContent =
-                `Пакетов: ${packets} | Запись: ${recording ? 'REC' : 'Idle'} | Сканирование: ${scanning ? 'ON' : 'OFF'}`;
-        }
-
+        // ----- Сканирование -----
         let scanActive = false;
-        let scanRefreshTimer = null;
 
         async function toggleScan() {
             if (scanActive) {
@@ -120,8 +169,9 @@
             } else {
                 await fetch('/scan/start', {method:'POST'});
             }
+            formDirty = false;
+            await refreshStatus();
             await refreshScanStatus();
-            await loadConfig();
         }
 
         async function refreshScanStatus() {
@@ -132,10 +182,6 @@
 
                 document.getElementById('scanBtn').textContent =
                     scanActive ? 'Остановить сканирование' : 'Начать сканирование';
-
-                // Блокировка формы конфига во время сканирования
-                const ids = ['freq','bw','sf','cr','sync','preamble','crc','iq'];
-                ids.forEach(id => document.getElementById(id).disabled = scanActive);
 
                 if (scanActive) {
                     const pct = Math.min(100, Math.floor(s.elapsed * 100 / s.duration));
@@ -162,7 +208,6 @@
                     document.getElementById('scanStatus').innerHTML = '';
                     document.getElementById('scanProgressBar').style.width = '0%';
 
-                    // При выходе из сканирования показываем итоговую сводку
                     let hitCount = 0;
                     let summary = '<table style="font-size:11px"><tr><th>Пресет</th><th>Найдено пакетов</th></tr>';
                     for (let i = 0; i < s.presets.length; i++) {
@@ -172,38 +217,17 @@
                         }
                     }
                     summary += '</table>';
-                    if (hitCount > 0) {
-                        document.getElementById('scanList').innerHTML =
-                            '<b>Найдено пресетов: ' + hitCount + '</b>' + summary;
-                    } else {
-                        document.getElementById('scanList').innerHTML = '';
-                    }
+                    document.getElementById('scanList').innerHTML =
+                        hitCount > 0 ? '<b>Найдено пресетов: ' + hitCount + '</b>' + summary : '';
                 }
-            } catch (e) {
-                console.error('refreshScanStatus', e);
-            }
+            } catch (e) { /* молча */ }
         }
 
-        function applyConfig() {
-            const fd = new FormData();
-            fd.append('freq', document.getElementById('freq').value);
-            fd.append('bw', document.getElementById('bw').value);
-            fd.append('sf', document.getElementById('sf').value);
-            fd.append('cr', document.getElementById('cr').value);
-            fd.append('sync', document.getElementById('sync').value);
-            fd.append('preamble', document.getElementById('preamble').value);
-            fd.append('crc', document.getElementById('crc').value);
-            fd.append('iq', document.getElementById('iq').value);
-            fetch('/config', { method: 'POST', body: fd })
-                .then(r => r.text())
-                .then(t => { alert(t); loadConfig(); refreshScanStatus(); });
-        }
-
-        // Первичная загрузка + периодическое обновление
-        loadConfig();
+        // ----- Старт -----
+        initialLoad();
         refreshScanStatus();
-        setInterval(loadConfig, 3000);
-        setInterval(refreshScanStatus, 1000);
+        setInterval(refreshStatus, 3000);        // статус — можно часто
+        setInterval(refreshScanStatus, 1000);    // сканирование — раз в секунду
     </script>
 </body>
 </html>
